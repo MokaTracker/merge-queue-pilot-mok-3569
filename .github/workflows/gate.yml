@@ -1,0 +1,230 @@
+name: Gate
+run-name: >-
+  ${{ github.event_name == 'workflow_run' &&
+  format('Gate on merge group {0}', github.event.workflow_run.head_sha) ||
+  format('Gate on #{0} head {1} ({2})', github.event.pull_request.number, github.event.pull_request.head.sha, github.event.action) }}
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, auto_merge_enabled]
+  workflow_run:
+    workflows: [Merge group relay]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  judge:
+    name: judge
+    if: >-
+      (github.event_name == 'pull_request_target' &&
+      github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'workflow_run' &&
+      github.event.workflow_run.event == 'merge_group' &&
+      github.event.workflow_run.repository.full_name == github.repository &&
+      github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      statuses: write
+    steps:
+      - name: Read the commit's tree as data under main's gate and post pilot/gate on that commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo=$GITHUB_REPOSITORY
+          event=$GITHUB_EVENT_PATH
+          out=$RUNNER_TEMP/evidence
+          mkdir -p "$out"
+          run_url="$GITHUB_SERVER_URL/$repo/actions/runs/$GITHUB_RUN_ID"
+          started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          sha=""
+          posted=""
+
+          post() {
+            gh api -X POST "repos/$repo/statuses/$sha" \
+              -f state="$1" -f context=pilot/gate -f description="${2:0:140}" -f target_url="$run_url" \
+              --jq '{id, state, description, created_at, creator: .creator.login, creator_type: .creator.type}'
+          }
+
+          finish() {
+            code=$?
+            if [[ -z $posted && -n $sha ]]; then
+              post error "the gate stopped before a verdict (exit $code)" > "$out/status-error.json" || true
+            fi
+          }
+          trap finish EXIT
+
+          case "$GITHUB_EVENT_NAME" in
+            pull_request_target)
+              mode="head"
+              candidate=$(jq -r '.pull_request.head.sha' "$event")
+              pull=$(jq -r '.pull_request.number' "$event")
+              branch=$(jq -r '.pull_request.head.ref' "$event")
+              jq '{action, number, sender: .sender.login, sender_type: .sender.type,
+                pull_request: {head_sha: .pull_request.head.sha, head_ref: .pull_request.head.ref,
+                  head_repo: .pull_request.head.repo.full_name, base_ref: .pull_request.base.ref,
+                  base_sha: .pull_request.base.sha, author: .pull_request.user.login,
+                  author_type: .pull_request.user.type, auto_merge: (.pull_request.auto_merge != null)}}' \
+                "$event" > "$out/event.json"
+              ;;
+            workflow_run)
+              mode="group"
+              candidate=$(jq -r '.workflow_run.head_sha' "$event")
+              branch=$(jq -r '.workflow_run.head_branch' "$event")
+              pull=""
+              if [[ $branch =~ ^gh-readonly-queue/main/pr-([0-9]+)-[0-9a-f]{40}$ ]]; then
+                pull=${BASH_REMATCH[1]}
+              fi
+              jq '{workflow_run: (.workflow_run | {id, name, event, status, conclusion, head_sha, head_branch,
+                path, run_attempt, created_at, actor: .actor.login, triggering_actor: .triggering_actor.login,
+                repository: .repository.full_name, head_repository: .head_repository.full_name,
+                pull_requests: [.pull_requests[]? | {number, head_sha: .head.sha}]})}' \
+                "$event" > "$out/event.json"
+              ;;
+            *)
+              echo "unexpected event $GITHUB_EVENT_NAME" >&2
+              exit 1
+              ;;
+          esac
+
+          if [[ ! $candidate =~ ^[0-9a-f]{40}$ ]]; then
+            echo "the event names no commit" >&2
+            exit 1
+          fi
+          sha=$candidate
+          prior=$(gh api "repos/$repo/commits/$sha/statuses?per_page=100" \
+            --jq '[.[] | select(.context == "pilot/gate" and .state != "pending")] | length')
+          if [[ $mode == group || $prior == 0 ]]; then
+            post pending "judging the $mode commit" > "$out/status-pending.json"
+          else
+            jq -n --argjson prior "$prior" '{skipped: "a verdict already stands on this head; no pending over it", prior: $prior}' \
+              > "$out/status-pending.json"
+          fi
+
+          reasons=()
+          commit=$(gh api "repos/$repo/commits/$sha")
+          tree=$(jq -r '.commit.tree.sha' <<<"$commit")
+          parents=$(jq -c '[.parents[].sha]' <<<"$commit")
+          listing=$(gh api "repos/$repo/git/trees/$tree?recursive=1")
+          if [[ $(jq -r '.truncated' <<<"$listing") != false ]]; then
+            reasons+=("the tree listing is truncated")
+          fi
+          jq -r '.tree[] | select(.type == "blob") | .path' <<<"$listing" | LC_ALL=C sort > "$out/paths.txt"
+          has() { grep -Fxq -- "$1" "$out/paths.txt"; }
+
+          if has FAIL; then
+            reasons+=("the FAIL marker is at the tree root")
+          fi
+          if has check; then
+            gh api -H 'Accept: application/vnd.github.raw+json' "repos/$repo/contents/check?ref=$sha" > "$out/check.txt"
+            while IFS= read -r line || [[ -n $line ]]; do
+              if [[ -z $line || $line == '#'* ]]; then
+                continue
+              fi
+              if [[ $line =~ ^require\ ([A-Za-z0-9._/-]+)$ ]]; then
+                need=${BASH_REMATCH[1]}
+                has "$need" || reasons+=("check requires $need, which this tree lacks")
+              else
+                reasons+=("check has a line the gate does not read")
+              fi
+            done < "$out/check.txt"
+          else
+            reasons+=("the tree has no check spec")
+          fi
+
+          delay=0
+          live=""
+          if [[ $mode == head ]]; then
+            gh api "repos/$repo/compare/main...$sha" \
+              --jq '{count: ((.files // []) | length), files: [(.files // [])[] | .filename, (.previous_filename // empty)]}' \
+              > "$out/changed.json"
+            jq -r '.files[]' "$out/changed.json" > "$out/changed.txt"
+            if (( $(jq '.count' "$out/changed.json") >= 300 )); then
+              reasons+=("the commit changes 300 or more files, more than the gate reads")
+            fi
+            if grep -q '^\.github/' "$out/changed.txt"; then
+              reasons+=("the commit changes .github/, which no queue entry may do")
+            fi
+          else
+            if [[ -z $pull ]]; then
+              reasons+=("the head branch is not gh-readonly-queue/main/pr-N-<sha>")
+            else
+              live=$(gh api "repos/$repo/git/ref/heads/$branch" --jq '.object.sha' 2>/dev/null || true)
+            fi
+            first=$(jq -r '.[0] // empty' <<<"$parents")
+            if [[ -n $first ]]; then
+              gh api "repos/$repo/compare/$first...$sha" \
+                --jq '(.files // [])[] | select(.status == "added" or .status == "modified") | .filename' > "$out/own.txt"
+              while IFS= read -r file; do
+                [[ $file =~ ^lab/[A-Za-z0-9._-]+$ ]] || continue
+                asked=$(gh api -H 'Accept: application/vnd.github.raw+json' "repos/$repo/contents/$file?ref=$sha" \
+                  | grep -Eo '^group-delay-seconds: [0-9]{1,3}$' | head -n 1 | grep -Eo '[0-9]+$' || true)
+                if [[ -n $asked ]] && (( 10#$asked > delay )); then
+                  delay=$((10#$asked))
+                fi
+              done < "$out/own.txt"
+            fi
+            if (( delay > 120 )); then
+              delay=120
+            fi
+          fi
+
+          if (( delay > 0 )); then
+            sleep "$delay"
+          fi
+
+          if (( ${#reasons[@]} == 0 )); then
+            state=success
+            description="pass: $mode tree ${tree:0:12}"
+            : > "$out/reasons.txt"
+          else
+            state=failure
+            description=${reasons[0]}
+            printf '%s\n' "${reasons[@]}" > "$out/reasons.txt"
+          fi
+          post "$state" "$description" > "$out/status-final.json"
+          posted=yes
+
+          jq -n \
+            --arg mode "$mode" --arg sha "$sha" --arg tree "$tree" --argjson parents "$parents" \
+            --arg pull "$pull" --arg branch "$branch" --arg live "$live" --arg state "$state" \
+            --argjson delay "$delay" --arg started "$started" --arg finished "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg event_name "$GITHUB_EVENT_NAME" --arg github_sha "$GITHUB_SHA" --arg github_ref "$GITHUB_REF" \
+            --arg workflow_ref "$GITHUB_WORKFLOW_REF" --arg workflow_sha "$GITHUB_WORKFLOW_SHA" \
+            --arg run_id "$GITHUB_RUN_ID" --arg run_attempt "$GITHUB_RUN_ATTEMPT" --arg run_url "$run_url" \
+            --arg actor "$GITHUB_ACTOR" --arg triggering_actor "$GITHUB_TRIGGERING_ACTOR" \
+            --rawfile reasons "$out/reasons.txt" \
+            --slurpfile event "$out/event.json" \
+            --slurpfile pending "$out/status-pending.json" \
+            --slurpfile final "$out/status-final.json" \
+            '{mode: $mode, subject_sha: $sha, tree_sha: $tree, parents: $parents,
+              pull_request: $pull, branch: $branch, group_ref_sha_when_judged: $live,
+              verdict: $state, reasons: ($reasons | split("\n") | map(select(length > 0))),
+              group_delay_seconds: $delay, started: $started, finished: $finished,
+              github: {event_name: $event_name, sha: $github_sha, ref: $github_ref,
+                workflow_ref: $workflow_ref, workflow_sha: $workflow_sha,
+                run_id: $run_id, run_attempt: $run_attempt, run_url: $run_url,
+                actor: $actor, triggering_actor: $triggering_actor},
+              event: $event[0], status_pending: $pending[0], status_final: $final[0]}' \
+            > "$out/evidence.json"
+
+          {
+            echo "### pilot/gate $state on the $mode commit $sha"
+            echo
+            echo '```json'
+            cat "$out/evidence.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the evidence as an artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/evidence
+          retention-days: 30
+          if-no-files-found: warn

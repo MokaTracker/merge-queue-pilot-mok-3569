@@ -1,0 +1,17 @@
+name: Merge group relay
+
+on:
+  merge_group:
+    types: [checks_requested]
+
+permissions: {}
+
+jobs:
+  relay:
+    name: relay
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    permissions: {}
+    steps:
+      - name: Hand the merge group to the gate, whose workflow_run judges it under main's code
+        run: "true"

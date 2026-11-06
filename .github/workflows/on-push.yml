@@ -1,0 +1,50 @@
+name: On push
+run-name: On push to main at ${{ github.sha }}
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  record:
+    name: record
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Record the pushed commit and who pushed it
+        run: |
+          set -euo pipefail
+          out=$RUNNER_TEMP/evidence
+          mkdir -p "$out"
+          jq '{ref, before, after, created, forced, pusher: .pusher.name, sender: .sender.login,
+            sender_type: .sender.type, head_commit_id: .head_commit.id, head_commit_tree: .head_commit.tree_id,
+            head_commit_author: .head_commit.author.username, head_commit_committer: .head_commit.committer.username,
+            commits: [.commits[]?.id]}' "$GITHUB_EVENT_PATH" > "$out/event.json"
+          jq -n \
+            --arg sha "$GITHUB_SHA" --arg ref "$GITHUB_REF" --arg event_name "$GITHUB_EVENT_NAME" \
+            --arg actor "$GITHUB_ACTOR" --arg triggering_actor "$GITHUB_TRIGGERING_ACTOR" \
+            --arg workflow_sha "$GITHUB_WORKFLOW_SHA" --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_attempt "$GITHUB_RUN_ATTEMPT" --arg recorded "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --slurpfile event "$out/event.json" \
+            '{pushed_sha: $sha, ref: $ref, event_name: $event_name, actor: $actor,
+              triggering_actor: $triggering_actor, workflow_sha: $workflow_sha, run_id: $run_id,
+              run_attempt: $run_attempt, recorded: $recorded, event: $event[0]}' > "$out/evidence.json"
+          {
+            echo "### push to main at $GITHUB_SHA by $GITHUB_ACTOR"
+            echo
+            echo '```json'
+            cat "$out/evidence.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the evidence as an artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: push-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/evidence
+          retention-days: 30
+          if-no-files-found: warn

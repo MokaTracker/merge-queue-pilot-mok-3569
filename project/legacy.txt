@@ -1,0 +1,1 @@
+a file nothing requires on main; scenario s4 makes one pull request require it and another delete it

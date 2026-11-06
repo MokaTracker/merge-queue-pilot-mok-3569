@@ -1,0 +1,58 @@
+name: Bot pull request
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  open:
+    name: open
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Open a synthetic pull request as github-actions[bot] with GITHUB_TOKEN
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo=$GITHUB_REPOSITORY
+          out=$RUNNER_TEMP/evidence
+          mkdir -p "$out"
+          branch="bot/pilot-f-$GITHUB_RUN_ID"
+          file="lab/f-bot-$GITHUB_RUN_ID.txt"
+          base=$(gh api "repos/$repo/git/ref/heads/main" --jq '.object.sha')
+          base_tree=$(gh api "repos/$repo/git/commits/$base" --jq '.tree.sha')
+          tree=$(jq -n --arg base_tree "$base_tree" --arg file "$file" --arg run "$GITHUB_RUN_ID" \
+            '{base_tree: $base_tree, tree: [{path: $file, mode: "100644", type: "blob",
+              content: ("opened by github-actions[bot] in run " + $run + "\n")}]}' \
+            | gh api -X POST "repos/$repo/git/trees" --input - --jq '.sha')
+          commit=$(jq -n --arg tree "$tree" --arg base "$base" \
+            '{message: "pilot(f): a pull request github-actions[bot] opened", tree: $tree, parents: [$base]}' \
+            | gh api -X POST "repos/$repo/git/commits" --input - --jq '.sha')
+          gh api -X POST "repos/$repo/git/refs" -f ref="refs/heads/$branch" -f sha="$commit" > /dev/null
+          jq -n --arg head "$branch" \
+            '{title: "pilot(f): a pull request github-actions[bot] opened", head: $head, base: "main",
+              body: "Synthetic pull request the Bot pull request workflow opened with GITHUB_TOKEN, for proof (f) of MOK-3569."}' \
+            | gh api -X POST "repos/$repo/pulls" --input - \
+              --jq '{number, node_id, html_url, author: .user.login, author_type: .user.type, head_sha: .head.sha, head_ref: .head.ref}' \
+            > "$out/pull-request.json"
+          {
+            echo "### github-actions[bot] opened a pull request"
+            echo
+            echo '```json'
+            cat "$out/pull-request.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the evidence as an artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bot-pr-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/evidence
+          retention-days: 30
+          if-no-files-found: warn
