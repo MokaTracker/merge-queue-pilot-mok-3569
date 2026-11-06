@@ -1,0 +1,2 @@
+s5: dequeue, re-arm, then push while queued
+group-delay-seconds: 90
