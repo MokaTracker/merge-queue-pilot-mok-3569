@@ -1,0 +1,2 @@
+s4y: deletes project/legacy.txt, which s4x makes required
+group-delay-seconds: 100
