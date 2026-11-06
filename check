@@ -1,3 +1,4 @@
 # Lines the gate reads as data. It never runs this file.
 # require <path>: the tree must contain <path>.
 require project/hello.txt
+require project/legacy.txt
