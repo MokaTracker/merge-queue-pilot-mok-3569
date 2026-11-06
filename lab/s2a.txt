@@ -1,0 +1,2 @@
+s2a: armed with enablePullRequestAutoMerge before its gate passed
+group-delay-seconds: 75
